@@ -1,10 +1,12 @@
 package socks5
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 const BufferSize = 2048
@@ -152,37 +154,46 @@ func (s *Server) handleUDP(udpConn *net.UDPConn) {
 	reqChan := make(chan *UDPRequest)
 	respChan := make(chan *UDPRequest)
 
-	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-	conn, err := net.ListenUDP("udp", localAddr)
-	if err != nil {
-		panic(err)
-	}
-
-	go s.handleUDPRequest(conn, reqChan)
+	go s.handleUDPRequest(reqChan, respChan)
 	go s.handleUDPResponse(udpConn, respChan)
 	go s.serveRequest(udpConn, reqChan)
-	go s.serveResponse(conn, respChan)
 }
 
-// map[remoteAddr]*UDPRequest
-var remoteRequestMap sync.Map
+// map[localAddr]map[remoteAddr]*UDPRequest
+var connMap sync.Map
 
-func (s *Server) serveResponse(udpConn *net.UDPConn, respChan chan *UDPRequest) {
+func (s *Server) serveConnection(udpConn *net.UDPConn, respChan chan *UDPRequest) {
+	m, _ := connMap.Load(udpConn)
+	remoteRequestMap := m.(*sync.Map)
+	readCh := make(chan struct{})
+	go func() {
+		for {
+			buffer := make([]byte, BufferSize)
+			n, addr, err := udpConn.ReadFromUDP(buffer)
+			if err != nil {
+				s.config.Logger.Printf("receive udp from %s: %s", addr, err)
+			}
+			s.config.Logger.Printf("receive data from remote: %s", addr)
+			buffer = buffer[:n]
+			rr, ok := remoteRequestMap.Load(addr.String())
+			if !ok {
+				s.config.Logger.Printf("no client connection for packet from %s", addr)
+				continue
+			}
+			r := rr.(*UDPRequest)
+			r.Request.Data = buffer
+			respChan <- r
+			readCh <- struct{}{}
+		}
+	}()
 	for {
-		buffer := make([]byte, BufferSize)
-		n, addr, err := udpConn.ReadFromUDP(buffer)
-		if err != nil {
-			s.config.Logger.Printf("receive udp from %s: %s", addr, err)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		select {
+		case <-ctx.Done():
+			cancel()
+			return
+		case <-readCh:
 		}
-		buffer = buffer[:n]
-		rr, ok := remoteRequestMap.Load(addr.String())
-		if !ok {
-			s.config.Logger.Printf("no client connection for packet from %s", addr)
-			continue
-		}
-		r := rr.(*UDPRequest)
-		r.Request.Data = buffer
-		respChan <- r
 	}
 }
 
@@ -207,22 +218,60 @@ func (s *Server) serveRequest(udpConn *net.UDPConn, reqChan chan *UDPRequest) {
 	}
 }
 
-func (s *Server) handleUDPRequest(conn *net.UDPConn, reqChan chan *UDPRequest) {
+func (s *Server) handleUDPRequest(reqChan chan *UDPRequest, respChan chan *UDPRequest) {
 	for r := range reqChan {
-		s.config.Logger.Printf("send to remote: %s", r.Request.RemoteAddress())
-
 		ra := r.Request.RemoteAddress()
+
+		// get or create connection for client-connection pair
+		var conn *net.UDPConn
+		connMap.Range(func(k, v interface{}) bool {
+			c := k.(*net.UDPConn)
+			remoteRequestMap := v.(*sync.Map)
+			// already connected to this remote
+			if v, ok := remoteRequestMap.Load(ra); ok {
+				req := v.(*UDPRequest)
+				// client is the same, reuse it
+				if req.Address.String() == r.Address.String() {
+					s.config.Logger.Printf("reuse connection for %s to %s", req.Address, ra)
+					conn = c
+					// break
+					return false
+				}
+				// else, continue to pick another connection
+				return true
+			}
+			return true
+		})
+
+		if conn == nil {
+			localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+			c, err := net.ListenUDP("udp", localAddr)
+			if err != nil {
+				s.config.Logger.Printf("failed to listen udp: %s", err)
+				continue
+			}
+			s.config.Logger.Printf("no connection available for %s->%s, spawn new at %s", r.Address, ra, c.LocalAddr())
+			connMap.Store(c, &sync.Map{})
+			// start goroutine to handle this connection
+			go s.serveConnection(c, respChan)
+			conn = c
+		}
 		addr, err := net.ResolveUDPAddr("udp", ra)
 		if err != nil {
 			s.config.Logger.Printf("failed to resolve remote %s: %s", ra)
 			continue
 		}
+		s.config.Logger.Printf("send data to remote %s with %s", addr, conn.LocalAddr())
 		n, err := conn.WriteToUDP(r.Request.Data, addr)
 		if err != nil {
 			s.config.Logger.Printf("fail to send udp to %s: %s", ra, err)
 			continue
 		}
-		remoteRequestMap.Store(ra, r)
+
+		mm, _ := connMap.Load(conn)
+		m := mm.(*sync.Map)
+		m.Store(ra, r)
+
 		size := len(r.Request.Data)
 		if n != size {
 			s.config.Logger.Printf("send udp to %s: size %d mismatch %d", ra, n, size)
@@ -236,7 +285,7 @@ func (s *Server) handleUDPResponse(conn *net.UDPConn, respChan chan *UDPRequest)
 		if err != nil {
 			s.config.Logger.Printf("send response to %s: %s", r.Address, err)
 		}
-		s.config.Logger.Printf("send response to %s", r.Address)
+		s.config.Logger.Printf("send response to client: %s", r.Address)
 		size := r.Request.Size()
 		if n != size {
 			s.config.Logger.Printf("send reply to %s: size mismatch, expected %d got %d", r.Address, size, n)
