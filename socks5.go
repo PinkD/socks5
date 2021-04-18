@@ -126,7 +126,7 @@ func (s *Server) Serve(l net.Listener) error {
 		if err != nil {
 			return err
 		}
-		go s.handleUDP(c)
+		s.handleUDP(c)
 	}
 
 	for {
