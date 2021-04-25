@@ -135,7 +135,8 @@ func (r *S5Request) ToPacket() []byte {
 	packet[offset+1] = byte(r.Port & 0xFF)
 	offset += 2
 	copy(packet[offset:], r.Data)
-	return packet
+	// cut extra
+	return packet[:offset+len(r.Data)]
 }
 
 func S5RequestFromPacket(packet []byte) *S5Request {
@@ -159,19 +160,22 @@ func (s *Server) handleUDP(udpConn *net.UDPConn) {
 	go s.serveRequest(udpConn, reqChan)
 }
 
-// map[localAddr]map[remoteAddr]*UDPRequest
+// map[conn]map[remoteAddr]*UDPRequest
 var connMap sync.Map
 
 func (s *Server) serveConnection(udpConn *net.UDPConn, respChan chan *UDPRequest) {
 	m, _ := connMap.Load(udpConn)
 	remoteRequestMap := m.(*sync.Map)
 	readCh := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	go func() {
 		for {
 			buffer := make([]byte, BufferSize)
 			n, addr, err := udpConn.ReadFromUDP(buffer)
 			if err != nil {
-				s.config.Logger.Printf("receive udp from %s: %s", addr, err)
+				s.config.Logger.Printf("failed to receive udp from %s: %s", addr, err)
+				cancel()
+				return
 			}
 			s.config.Logger.Printf("receive data from remote: %s", addr)
 			buffer = buffer[:n]
@@ -187,10 +191,14 @@ func (s *Server) serveConnection(udpConn *net.UDPConn, respChan chan *UDPRequest
 		}
 	}()
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		ctx, cancel = context.WithTimeout(context.Background(), time.Minute)
 		select {
 		case <-ctx.Done():
+			s.config.Logger.Printf("closing connection: %s", udpConn.LocalAddr())
 			cancel()
+			// release timeout connection
+			connMap.Delete(udpConn)
+			_ = udpConn.Close()
 			return
 		case <-readCh:
 		}
@@ -230,7 +238,7 @@ func (s *Server) handleUDPRequest(reqChan chan *UDPRequest, respChan chan *UDPRe
 			// already connected to this remote
 			if v, ok := remoteRequestMap.Load(ra); ok {
 				req := v.(*UDPRequest)
-				// client is the same, reuse it
+				// same client, reuse the connection
 				if req.Address.String() == r.Address.String() {
 					s.config.Logger.Printf("reuse connection for %s to %s", req.Address, ra)
 					conn = c
@@ -242,7 +250,7 @@ func (s *Server) handleUDPRequest(reqChan chan *UDPRequest, respChan chan *UDPRe
 			}
 			return true
 		})
-
+		// no connection available, create one
 		if conn == nil {
 			localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 			c, err := net.ListenUDP("udp", localAddr)
