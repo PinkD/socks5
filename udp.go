@@ -167,7 +167,8 @@ func (s *Server) serveConnection(udpConn *net.UDPConn, respChan chan *UDPRequest
 	m, _ := connMap.Load(udpConn)
 	remoteRequestMap := m.(*sync.Map)
 	readCh := make(chan struct{})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	timeout := 5 * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	go func() {
 		for {
 			buffer := make([]byte, BufferSize)
@@ -191,7 +192,7 @@ func (s *Server) serveConnection(udpConn *net.UDPConn, respChan chan *UDPRequest
 		}
 	}()
 	for {
-		ctx, cancel = context.WithTimeout(context.Background(), time.Minute)
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
 		select {
 		case <-ctx.Done():
 			s.config.Logger.Printf("closing connection: %s", udpConn.LocalAddr())
@@ -219,10 +220,15 @@ func (s *Server) serveRequest(udpConn *net.UDPConn, reqChan chan *UDPRequest) {
 		s.config.Logger.Printf("accept udp: %s", src)
 
 		buffer = buffer[:n]
-		reqChan <- &UDPRequest{
+		r := &UDPRequest{
 			Address: src,
 			Request: S5RequestFromPacket(buffer),
 		}
+		if r.Request.Frag != 0 {
+			s.config.Logger.Printf("fragment is not supported yet, from %s", src)
+			continue
+		}
+		reqChan <- r
 	}
 }
 
