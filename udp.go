@@ -1,12 +1,10 @@
 package socks5
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net"
 	"sync"
-	"time"
 )
 
 const BufferSize = 2048
@@ -150,63 +148,53 @@ type UDPRequest struct {
 	Request *S5Request
 }
 
-func (s *Server) handleUDP(udpConn *net.UDPConn) {
-	// send back reply thread
-	reqChan := make(chan *UDPRequest)
-	respChan := make(chan *UDPRequest)
+var l sync.RWMutex
+var connMap map[string]*UDPRequest
+var conn *net.UDPConn
 
-	go s.handleUDPRequest(reqChan, respChan)
-	go s.handleUDPResponse(udpConn, respChan)
-	go s.serveRequest(udpConn, reqChan)
+func (s *Server) handleUDP(udpConn *net.UDPConn) {
+	connMap = make(map[string]*UDPRequest)
+
+	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	c, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		s.config.Logger.Printf("failed to listen udp: %s", err)
+		return
+	}
+	conn = c
+
+	go s.serveLocalConnection(udpConn)
+	go s.serveRequest(udpConn)
 }
 
 // map[conn]map[remoteAddr]*UDPRequest
-var connMap sync.Map
+// var connMap sync.Map
 
-func (s *Server) serveConnection(udpConn *net.UDPConn, respChan chan *UDPRequest) {
-	m, _ := connMap.Load(udpConn)
-	remoteRequestMap := m.(*sync.Map)
-	readCh := make(chan struct{})
-	timeout := 5 * time.Minute
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (s *Server) serveLocalConnection(udpConn *net.UDPConn) {
 	go func() {
 		for {
 			buffer := make([]byte, BufferSize)
-			n, addr, err := udpConn.ReadFromUDP(buffer)
+			n, addr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
 				s.config.Logger.Printf("failed to receive udp from %s: %s", addr, err)
-				cancel()
 				return
 			}
 			s.config.Logger.Printf("receive data from remote: %s", addr)
 			buffer = buffer[:n]
-			rr, ok := remoteRequestMap.Load(addr.String())
+			l.RLock()
+			r, ok := connMap[addr.String()]
+			l.RUnlock()
 			if !ok {
 				s.config.Logger.Printf("no client connection for packet from %s", addr)
 				continue
 			}
-			r := rr.(*UDPRequest)
 			r.Request.Data = buffer
-			respChan <- r
-			readCh <- struct{}{}
+			s.handleUDPResponse(udpConn, r)
 		}
 	}()
-	for {
-		ctx, cancel = context.WithTimeout(context.Background(), timeout)
-		select {
-		case <-ctx.Done():
-			s.config.Logger.Printf("closing connection: %s", udpConn.LocalAddr())
-			cancel()
-			// release timeout connection
-			connMap.Delete(udpConn)
-			_ = udpConn.Close()
-			return
-		case <-readCh:
-		}
-	}
 }
 
-func (s *Server) serveRequest(udpConn *net.UDPConn, reqChan chan *UDPRequest) {
+func (s *Server) serveRequest(udpConn *net.UDPConn) {
 	for {
 		buffer := make([]byte, BufferSize)
 		n, src, err := udpConn.ReadFromUDP(buffer)
@@ -228,81 +216,40 @@ func (s *Server) serveRequest(udpConn *net.UDPConn, reqChan chan *UDPRequest) {
 			s.config.Logger.Printf("fragment is not supported yet, from %s", src)
 			continue
 		}
-		reqChan <- r
+		s.handleUDPRequest(r)
 	}
 }
 
-func (s *Server) handleUDPRequest(reqChan chan *UDPRequest, respChan chan *UDPRequest) {
-	for r := range reqChan {
-		ra := r.Request.RemoteAddress()
-
-		// get or create connection for client-connection pair
-		var conn *net.UDPConn
-		connMap.Range(func(k, v interface{}) bool {
-			c := k.(*net.UDPConn)
-			remoteRequestMap := v.(*sync.Map)
-			// already connected to this remote
-			if v, ok := remoteRequestMap.Load(ra); ok {
-				req := v.(*UDPRequest)
-				// same client, reuse the connection
-				if req.Address.String() == r.Address.String() {
-					s.config.Logger.Printf("reuse connection for %s to %s", req.Address, ra)
-					conn = c
-					// break
-					return false
-				}
-				// else, continue to pick another connection
-				return true
-			}
-			return true
-		})
-		// no connection available, create one
-		if conn == nil {
-			localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-			c, err := net.ListenUDP("udp", localAddr)
-			if err != nil {
-				s.config.Logger.Printf("failed to listen udp: %s", err)
-				continue
-			}
-			s.config.Logger.Printf("no connection available for %s->%s, spawn new at %s", r.Address, ra, c.LocalAddr())
-			connMap.Store(c, &sync.Map{})
-			// start goroutine to handle this connection
-			go s.serveConnection(c, respChan)
-			conn = c
-		}
-		addr, err := net.ResolveUDPAddr("udp", ra)
-		if err != nil {
-			s.config.Logger.Printf("failed to resolve remote %s: %s", ra)
-			continue
-		}
-		s.config.Logger.Printf("send data to remote %s with %s", addr, conn.LocalAddr())
-		n, err := conn.WriteToUDP(r.Request.Data, addr)
-		if err != nil {
-			s.config.Logger.Printf("fail to send udp to %s: %s", ra, err)
-			continue
-		}
-
-		mm, _ := connMap.Load(conn)
-		m := mm.(*sync.Map)
-		m.Store(ra, r)
-
-		size := len(r.Request.Data)
-		if n != size {
-			s.config.Logger.Printf("send udp to %s: size %d mismatch %d", ra, n, size)
-		}
+func (s *Server) handleUDPRequest(r *UDPRequest) {
+	ra := r.Request.RemoteAddress()
+	addr, err := net.ResolveUDPAddr("udp", ra)
+	if err != nil {
+		s.config.Logger.Printf("failed to resolve remote %s: %s", ra)
+		return
+	}
+	s.config.Logger.Printf("send data to remote %s", addr)
+	n, err := conn.WriteToUDP(r.Request.Data, addr)
+	if err != nil {
+		s.config.Logger.Printf("fail to send udp to %s: %s", ra, err)
+		return
+	}
+	l.Lock()
+	connMap[ra] = r
+	l.Unlock()
+	size := len(r.Request.Data)
+	if n != size {
+		s.config.Logger.Printf("send udp to %s: size %d mismatch %d", ra, n, size)
 	}
 }
 
-func (s *Server) handleUDPResponse(conn *net.UDPConn, respChan chan *UDPRequest) {
-	for r := range respChan {
-		n, err := conn.WriteToUDP(r.Request.ToPacket(), r.Address)
-		if err != nil {
-			s.config.Logger.Printf("send response to %s: %s", r.Address, err)
-		}
-		s.config.Logger.Printf("send response to client: %s", r.Address)
-		size := r.Request.Size()
-		if n != size {
-			s.config.Logger.Printf("send reply to %s: size mismatch, expected %d got %d", r.Address, size, n)
-		}
+func (s *Server) handleUDPResponse(conn *net.UDPConn, r *UDPRequest) {
+	n, err := conn.WriteToUDP(r.Request.ToPacket(), r.Address)
+	if err != nil {
+		s.config.Logger.Printf("send response to %s: %s", r.Address, err)
+	}
+	s.config.Logger.Printf("send response to client: %s", r.Address)
+	size := r.Request.Size()
+	if n != size {
+		s.config.Logger.Printf("send reply to %s: size mismatch, expected %d got %d", r.Address, size, n)
 	}
 }
